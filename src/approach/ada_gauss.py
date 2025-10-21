@@ -7,6 +7,7 @@ import numpy as np
 from argparse import ArgumentParser
 from itertools import compress
 from torch import nn
+import torch.utils
 from torch.utils.data import Dataset
 from torchmetrics import Accuracy
 
@@ -37,6 +38,31 @@ class SampledDataset(torch.utils.data.Dataset):
         val = self.distributions[target].sample()
         return val, target
 
+## Attention Module Newtwork
+class AttentionModule(nn.Module):
+    def __init__(self, feature_dim):
+        super(AttentionModule, self).__init__()
+        self.fc = nn.Linear(feature_dim, feature_dim, bias=False)
+
+    def forward(self, old_features):
+        scaling_factors = torch.sigmoid(self.fc(old_features))
+        return scaling_factors
+
+class AttentionAdapter(nn.Module):
+    def __init__(self, feature_dim, multiplier):
+        super(AttentionAdapter, self).__init__()
+        self.attention = AttentionModule(feature_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_dim, multiplier * feature_dim),
+            nn.GELU(),
+            nn.Linear(multiplier * feature_dim, feature_dim)
+        )
+
+    def forward(self, old_features):
+        scaling_factors = self.attention(old_features)
+        adjustments = self.mlp(old_features)
+        adapted_features = old_features + scaling_factors * adjustments
+        return adapted_features
 
 class Appr(Inc_Learning_Appr):
     """Class implementing AdaGauss algorithm"""
@@ -44,7 +70,8 @@ class Appr(Inc_Learning_Appr):
     def __init__(self, model, device, nepochs=200, lr=0.05, lr_min=1e-4, lr_factor=3, lr_patience=5, clipgrad=1,
                  momentum=0, wd=0, multi_softmax=False, wu_nepochs=0, wu_lr_factor=1, nnet="resnet18", patience=5, fix_bn=False, eval_on_train=False,
                  logger=None, N=10000, alpha=1., lr_backbone=0.01, lr_adapter=0.01, beta=1., distillation="projected", use_224=False, S=64, dump=False, rotation=False, distiller="linear", adapter="linear", criterion="proxy-nca", lamb=10, tau=2, smoothing=0., sval_fraction=0.95,
-                 adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes"):
+                 adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes", 
+                 gamma_supcon=1.0, supcon_tau=0.07, samples_per_class=10):
         super(Appr, self).__init__(model, device, nepochs, lr, lr_min, lr_factor, lr_patience, clipgrad, momentum, wd,
                                    multi_softmax, wu_nepochs, wu_lr_factor, fix_bn, eval_on_train, logger,
                                    exemplars_dataset=None)
@@ -64,6 +91,10 @@ class Appr(Inc_Learning_Appr):
         self.adaptation_strategy = adaptation_strategy
         self.old_model = None
         self.pretrained = pretrained_net
+        self.gamma_supcon = gamma_supcon
+        self.supcon_tau = supcon_tau
+        self.samples_per_class = samples_per_class
+
         if nnet == "vit":
             state_dict = torch.load("dino_deitsmall16_pretrain.pth")
             self.model = vit_small(num_features=S)
@@ -111,109 +142,36 @@ class Appr(Inc_Learning_Appr):
     def extra_parser(args):
         """Returns a parser containing the approach specific parameters"""
         parser = ArgumentParser()
-        parser.add_argument('--N',
-                            help='Number of samples to adapt cov',
-                            type=int,
-                            default=10000)
-        parser.add_argument('--S',
-                            help='latent space size',
-                            type=int,
-                            default=64)
-        parser.add_argument('--alpha',
-                            help='Weight of anti-collapse loss',
-                            type=float,
-                            default=1.0)
-        parser.add_argument('--beta',
-                            help='Anti-collapse loss clamp',
-                            type=float,
-                            default=1.0)
-        parser.add_argument('--lamb',
-                            help='Weight of kd loss',
-                            type=float,
-                            default=10)
-        parser.add_argument('--lr-backbone',
-                            help='lr for backbone of the pretrained model',
-                            type=float,
-                            default=0.01)
-        parser.add_argument('--lr-adapter',
-                            help='lr for backbone of the adapter',
-                            type=float,
-                            default=0.01)
-        parser.add_argument('--multiplier',
-                            help='mlp multiplier',
-                            type=int,
-                            default=32)
-        parser.add_argument('--tau',
-                            help='temperature for logit distill',
-                            type=float,
-                            default=2)
-        parser.add_argument('--shrink',
-                            help='shrink during training',
-                            type=float,
-                            default=0)
-        parser.add_argument('--sval-fraction',
-                            help='Fraction of eigenvalues sum that is explained',
-                            type=float,
-                            default=0.95)
-        parser.add_argument('--adaptation-strategy',
-                            help='Activation functions in resnet',
-                            type=str,
-                            choices=["none", "mean", "diag", "full"],
-                            default="full")
-        parser.add_argument('--distiller',
-                            help='Distiller',
-                            type=str,
-                            choices=["linear", "mlp"],
-                            default="mlp")
-        parser.add_argument('--adapter',
-                            help='Adapter',
-                            type=str,
-                            choices=["linear", "mlp"],
-                            default="mlp")
-        parser.add_argument('--criterion',
-                            help='Loss function',
-                            type=str,
-                            choices=["ce", "proxy-nca", "proxy-yolo"],
-                            default="ce")
-        parser.add_argument('--nnet',
-                            help='Type of neural network',
-                            type=str,
-                            choices=["vit", "resnet18", "resnet32"],
-                            default="resnet18")
-        parser.add_argument('--classifier',
-                            help='Classifier type',
-                            type=str,
-                            choices=["linear", "bayes", "nmc"],
-                            default="bayes")
-        parser.add_argument('--distillation',
-                            help='Loss function',
-                            type=str,
-                            choices=["projected", "logit", "feature", "none"],
-                            default="projected")
-        parser.add_argument('--smoothing',
-                            help='label smoothing',
-                            type=float,
-                            default=0.0)
-        parser.add_argument('--use-224',
-                            help='Additional max pool and different conv1 in Resnet18',
-                            action='store_true',
-                            default=False)
-        parser.add_argument('--pretrained-net',
-                            help='Load pretrained weights',
-                            action='store_true',
-                            default=False)
-        parser.add_argument('--normalize',
-                            help='normalize features and covariance matrices',
-                            action='store_true',
-                            default=False)
-        parser.add_argument('--dump',
-                            help='save checkpoints',
-                            action='store_true',
-                            default=False)
-        parser.add_argument('--rotation',
-                            help='Rotate images in the first task to enhance feature extractor',
-                            action='store_true',
-                            default=False)
+        parser.add_argument('--N', help='Number of samples to adapt cov', type=int, default=10000)
+        parser.add_argument('--S', help='latent space size', type=int, default=64)
+        parser.add_argument('--alpha', help='Weight of anti-collapse loss', type=float, default=1.0)
+        parser.add_argument('--beta', help='Anti-collapse loss clamp', type=float, default=1.0)
+        parser.add_argument('--lamb', help='Weight of kd loss', type=float, default=10)
+        parser.add_argument('--lr-backbone', help='lr for backbone of the pretrained model', type=float, default=0.01)
+        parser.add_argument('--lr-adapter', help='lr for backbone of the adapter', type=float, default=0.01)
+        parser.add_argument('--multiplier', help='mlp multiplier', type=int, default=32)
+        parser.add_argument('--tau', help='temperature for logit distill', type=float, default=2)
+        parser.add_argument('--shrink', help='shrink during training', type=float, default=0)
+        parser.add_argument('--sval-fraction', help='Fraction of eigenvalues sum that is explained', type=float, default=0.95)
+        parser.add_argument('--adaptation-strategy', help='Activation functions in resnet', type=str, choices=["none", "mean", "diag", "full"], default="full")
+        parser.add_argument('--distiller', help='Distiller', type=str, choices=["linear", "mlp"], default="mlp")
+        parser.add_argument('--adapter', help='Adapter', type=str, choices=["linear", "mlp", "attention"], default="mlp")
+        parser.add_argument('--criterion', help='Loss function', type=str, choices=["ce", "proxy-nca", "proxy-yolo"], default="ce")
+        parser.add_argument('--nnet', help='Type of neural network', type=str, choices=["vit", "resnet18", "resnet32"], default="resnet18")
+        parser.add_argument('--classifier', help='Classifier type', type=str, choices=["linear", "bayes", "nmc"], default="bayes")
+        parser.add_argument('--distillation', help='Loss function', type=str, choices=["projected", "logit", "feature", "none"], default="projected")
+        parser.add_argument('--smoothing', help='label smoothing', type=float, default=0.0)
+        parser.add_argument('--use-224', help='Additional max pool and different conv1 in Resnet18', action='store_true', default=False)
+        parser.add_argument('--pretrained-net', help='Load pretrained weights', action='store_true', default=False)
+        parser.add_argument('--normalize', help='normalize features and covariance matrices', action='store_true', default=False)
+        parser.add_argument('--dump', help='save checkpoints', action='store_true', default=False)
+        parser.add_argument('--rotation', help='Rotate images in the first task to enhance feature extractor', action='store_true', default=False)
+
+        ## supcon new SL
+        parser.add_argument('--gamma-supcon', help='Weight of supervised contrastive loss (supcon) using pseudo-prototypes', type=float, default=1.0)
+        parser.add_argument('--supcon-tau', help='Temperature for supervised contrastive loss', type=float, default=0.07)
+        parser.add_argument('--samples-per-class', help='Number of pseudo-prototype samples per class for supcon', type=int, default=10)
+        
         return parser.parse_known_args(args)
 
     def train_loop(self, t, trn_loader, val_loader):
@@ -329,6 +287,32 @@ class Appr(Inc_Learning_Appr):
                 if self.alpha > 0:
                     ac, det = loss_ac(features, self.beta)
                     total_loss += self.alpha * ac
+
+                # Supervised contrastive loss using pseudo-prototypes from memorized Gaussians
+                if t > 0 and self.gamma_supcon > 0.0:
+                    # number of pseudo samples per old class (paper typically uses 10)
+                    samples_per_class = self.samples_per_class
+                    old_class_count = self.task_offset[t]
+                    if old_class_count > 0:
+                        pseudo_samples = []
+                        pseudo_labels = []
+                        for c in range(old_class_count):
+                            cov = self.covs[c].clone()
+                            mv = MultivariateNormal(self.means[c], cov)
+                            s = mv.sample((samples_per_class,)).to(self.device)
+                            pseudo_samples.append(s)
+                            pseudo_labels.extend([c] * samples_per_class)
+                        pseudo_samples = torch.cat(pseudo_samples, dim=0)
+                        pseudo_labels = torch.tensor(pseudo_labels, device=self.device)
+                        # absolute labels for current mini-batch
+                        abs_targets = targets + self.task_offset[t]
+                        z_img = F.normalize(features, p=2, dim=1)
+                        z_pseudo = F.normalize(pseudo_samples, p=2, dim=1)
+                        z_all = torch.cat([z_img, z_pseudo], dim=0)
+                        labels_all = torch.cat([abs_targets, pseudo_labels], dim=0)
+                        supcon_val = supcon_loss(z_all, labels_all, self.supcon_tau)
+                        total_loss = total_loss + self.gamma_supcon * supcon_val
+                            
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, 1)
                 optimizer.step()
@@ -443,9 +427,10 @@ class Appr(Inc_Learning_Appr):
                                     nn.GELU(),
                                     nn.Linear(self.multiplier * self.S, self.S)
                                     )
+        if self.adapter_type == "attention":
+            adapter = AttentionAdapter(self.S, self.multiplier)
+
         adapter.to(self.device, non_blocking=True)
-        # state_dict = torch.load(f"../ckpts/adapter_{t}.pth")
-        # adapter.load_state_dict(state_dict, strict=True)
         optimizer, lr_scheduler = self.get_adapter_optimizer(adapter.parameters())
         old_means = copy.deepcopy(self.means)
         old_covs = copy.deepcopy(self.covs)
@@ -461,7 +446,10 @@ class Appr(Inc_Learning_Appr):
                     target = self.model(images)
                     old_features = self.old_model(images)
                 adapted_features = adapter(old_features)
-                loss = torch.nn.functional.mse_loss(adapted_features, target)
+                # Compute per-sample squared norms then average over the batch:
+                # L = (1/|B|) * sum_i ||F_adapted(x_i) - F_t(x_i)||^2
+                diff = adapted_features - target
+                loss = torch.mean(torch.sum(diff * diff, dim=1))
                 ac, det = 0, torch.tensor(0)
                 if self.alpha > 0:
                     ac, det = loss_ac(adapted_features, self.beta)
@@ -483,7 +471,8 @@ class Appr(Inc_Learning_Appr):
                         target = self.model(images)
                         old_features = self.old_model(images)
                         adapted_features = adapter(old_features)
-                        total_loss = torch.nn.functional.mse_loss(adapted_features, target)
+                        diff = adapted_features - target
+                        total_loss = torch.mean(torch.sum(diff * diff, dim=1))
                         valid_loss.append(float(bsz * total_loss))
 
             train_loss = sum(train_loss) / len(trn_loader.dataset)
@@ -651,7 +640,7 @@ class Appr(Inc_Learning_Appr):
                 tag_preds = torch.argmax(logits, dim=1)
                 taw_preds = torch.argmax(logits[:, offset: offset + self.classes_in_tasks[t]], dim=1) + offset
             else:
-                if self.classifier == "bayes":  # Calcualte mahalanobis distances
+                if self.classifier == "bayes":  # Calculate Mahalanobis distances
                     if self.is_normalization:
                         diff = F.normalize(features.unsqueeze(1), p=2, dim=-1) - F.normalize(self.means.unsqueeze(0), p=2, dim=-1)
                     else:
@@ -886,3 +875,37 @@ def loss_ac(features, beta):
     # if bool(torch.isinf(loss)) or bool(torch.isnan(loss)):
     #     return torch.tensor(7777.), torch.tensor(0.)
     return loss, torch.det(cov)
+
+def supcon_loss(features, labels, tau=0.1):
+    """Supervised contrastive loss (per-sample average) for L2-normalized features.
+    features: (N, D) assumed normalized
+    labels: (N,) integer labels (absolute)
+    tau: temperature
+    Returns scalar loss
+    """
+    device = features.device
+    labels = labels.contiguous().view(-1, 1)
+    mask = torch.eq(labels, labels.T).float().to(device)  # NxN
+    # remove self-contrast
+    diag = torch.eye(mask.size(0), device=device)
+    mask = mask * (1 - diag)
+
+    # cosine similarity (since features normalized)
+    logits = torch.matmul(features, features.T) / tau
+    # numeric stability
+    logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+    logits = logits - logits_max.detach()
+
+    exp_logits = torch.exp(logits) * (1 - diag)
+    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-12)
+
+    # sum log_prob over positives
+    numerator = (mask * log_prob).sum(dim=1)
+    positives_per_sample = mask.sum(dim=1)
+    # avoid division by zero; compute only for samples with positives
+    valid = positives_per_sample > 0
+    if valid.sum() == 0:
+        return torch.tensor(0., device=device)
+
+    loss_per_sample = - numerator[valid] / (positives_per_sample[valid] + 1e-12)
+    return loss_per_sample.mean()
