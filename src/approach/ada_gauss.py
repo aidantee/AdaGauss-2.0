@@ -186,15 +186,15 @@ class Appr(Inc_Learning_Appr):
                             choices=["none", "mean", "diag", "full"],
                             default="full")
         parser.add_argument('--distiller',
-                            help='Distiller',
-                            type=str,
-                            choices=["linear", "mlp"],
-                            default="mlp")
+                    help='Distiller',
+                    type=str,
+                    choices=["linear", "mlp"],
+                    default="mlp")
         parser.add_argument('--adapter',
-                            help='Adapter',
-                            type=str,
-                            choices=["linear", "mlp"],
-                            default="mlp")
+                    help='Adapter',
+                    type=str,
+                    choices=["linear", "mlp", "attention"],
+                    default="mlp")
         parser.add_argument('--criterion',
                             help='Loss function',
                             type=str,
