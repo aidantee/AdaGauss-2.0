@@ -290,29 +290,28 @@ class Appr(Inc_Learning_Appr):
 
                 # Supervised contrastive loss using pseudo-prototypes from memorized Gaussians
                 if t > 0 and self.gamma_supcon > 0.0:
-                    with torch.no_grad():
-                        # number of pseudo samples per old class (paper typically uses 10)
-                        samples_per_class = self.samples_per_class
-                        old_class_count = self.task_offset[t]
-                        if old_class_count > 0:
-                            pseudo_samples = []
-                            pseudo_labels = []
-                            for c in range(old_class_count):
-                                cov = self.covs[c].clone()
-                                mv = MultivariateNormal(self.means[c], cov)
-                                s = mv.sample((samples_per_class,)).to(self.device)
-                                pseudo_samples.append(s)
-                                pseudo_labels.extend([c] * samples_per_class)
-                            pseudo_samples = torch.cat(pseudo_samples, dim=0)
-                            pseudo_labels = torch.tensor(pseudo_labels, device=self.device)
-                            # absolute labels for current mini-batch
-                            abs_targets = targets + self.task_offset[t]
-                            z_img = F.normalize(features, p=2, dim=1)
-                            z_pseudo = F.normalize(pseudo_samples, p=2, dim=1)
-                            z_all = torch.cat([z_img, z_pseudo], dim=0)
-                            labels_all = torch.cat([abs_targets, pseudo_labels], dim=0)
-                            supcon_val = supcon_loss(z_all, labels_all, self.supcon_tau)
-                            total_loss = total_loss + self.gamma_supcon * supcon_val
+                    # number of pseudo samples per old class (paper typically uses 10)
+                    samples_per_class = self.samples_per_class
+                    old_class_count = self.task_offset[t]
+                    if old_class_count > 0:
+                        pseudo_samples = []
+                        pseudo_labels = []
+                        for c in range(old_class_count):
+                            cov = self.covs[c].clone()
+                            mv = MultivariateNormal(self.means[c], cov)
+                            s = mv.sample((samples_per_class,)).to(self.device)
+                            pseudo_samples.append(s)
+                            pseudo_labels.extend([c] * samples_per_class)
+                        pseudo_samples = torch.cat(pseudo_samples, dim=0)
+                        pseudo_labels = torch.tensor(pseudo_labels, device=self.device)
+                        # absolute labels for current mini-batch
+                        abs_targets = targets + self.task_offset[t]
+                        z_img = F.normalize(features, p=2, dim=1)
+                        z_pseudo = F.normalize(pseudo_samples, p=2, dim=1)
+                        z_all = torch.cat([z_img, z_pseudo], dim=0)
+                        labels_all = torch.cat([abs_targets, pseudo_labels], dim=0)
+                        supcon_val = supcon_loss(z_all, labels_all, self.supcon_tau)
+                        total_loss = total_loss + self.gamma_supcon * supcon_val
                             
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, 1)
