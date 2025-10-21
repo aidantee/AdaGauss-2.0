@@ -7,6 +7,7 @@ import numpy as np
 from argparse import ArgumentParser
 from itertools import compress
 from torch import nn
+import torch.utils
 from torch.utils.data import Dataset
 from torchmetrics import Accuracy
 
@@ -37,6 +38,30 @@ class SampledDataset(torch.utils.data.Dataset):
         val = self.distributions[target].sample()
         return val, target
 
+class AttentionModule(nn.Module):
+    def __init__(self, feature_dim):
+        super(AttentionModule, self).__init__()
+        self.fc = nn.Linear(feature_dim, feature_dim, bias=False)
+
+    def forward(self, old_features):
+        scaling_factors = torch.sigmoid(self.fc(old_features))
+        return scaling_factors
+
+class AttentionAdapter(nn.Module):
+    def __init__(self, feature_dim, multiplier):
+        super(AttentionAdapter, self).__init__()
+        self.attention = AttentionModule(feature_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_dim, multiplier * feature_dim),
+            nn.GELU(),
+            nn.Linear(multiplier * feature_dim, feature_dim)
+        )
+
+    def forward(self, old_features):
+        scaling_factors = self.attention(old_features)
+        adjustments = self.mlp(old_features)
+        adapted_features = old_features + scaling_factors * adjustments
+        return adapted_features
 
 class Appr(Inc_Learning_Appr):
     """Class implementing AdaGauss algorithm"""
@@ -443,9 +468,10 @@ class Appr(Inc_Learning_Appr):
                                     nn.GELU(),
                                     nn.Linear(self.multiplier * self.S, self.S)
                                     )
+        if self.adapter_type == "attention":
+            adapter = AttentionAdapter(self.S, self.multiplier)
+
         adapter.to(self.device, non_blocking=True)
-        # state_dict = torch.load(f"../ckpts/adapter_{t}.pth")
-        # adapter.load_state_dict(state_dict, strict=True)
         optimizer, lr_scheduler = self.get_adapter_optimizer(adapter.parameters())
         old_means = copy.deepcopy(self.means)
         old_covs = copy.deepcopy(self.covs)
@@ -461,7 +487,10 @@ class Appr(Inc_Learning_Appr):
                     target = self.model(images)
                     old_features = self.old_model(images)
                 adapted_features = adapter(old_features)
-                loss = torch.nn.functional.mse_loss(adapted_features, target)
+                # Compute per-sample squared norms then average over the batch:
+                # L = (1/|B|) * sum_i ||F_adapted(x_i) - F_t(x_i)||^2
+                diff = adapted_features - target
+                loss = torch.mean(torch.sum(diff * diff, dim=1))
                 ac, det = 0, torch.tensor(0)
                 if self.alpha > 0:
                     ac, det = loss_ac(adapted_features, self.beta)
@@ -483,7 +512,8 @@ class Appr(Inc_Learning_Appr):
                         target = self.model(images)
                         old_features = self.old_model(images)
                         adapted_features = adapter(old_features)
-                        total_loss = torch.nn.functional.mse_loss(adapted_features, target)
+                        diff = adapted_features - target
+                        total_loss = torch.mean(torch.sum(diff * diff, dim=1))
                         valid_loss.append(float(bsz * total_loss))
 
             train_loss = sum(train_loss) / len(trn_loader.dataset)
@@ -651,7 +681,7 @@ class Appr(Inc_Learning_Appr):
                 tag_preds = torch.argmax(logits, dim=1)
                 taw_preds = torch.argmax(logits[:, offset: offset + self.classes_in_tasks[t]], dim=1) + offset
             else:
-                if self.classifier == "bayes":  # Calcualte mahalanobis distances
+                if self.classifier == "bayes":  # Calculate Mahalanobis distances
                     if self.is_normalization:
                         diff = F.normalize(features.unsqueeze(1), p=2, dim=-1) - F.normalize(self.means.unsqueeze(0), p=2, dim=-1)
                     else:
