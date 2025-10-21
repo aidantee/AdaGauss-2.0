@@ -180,7 +180,7 @@ class Appr(Inc_Learning_Appr):
         # Inter-class separation loss (AdaGauss+)
         parser.add_argument('--gamma-sep', help='Weight of inter-class separation loss (L_sep)', type=float, default=0.5)
         parser.add_argument('--sep-margin', help='Target margin m for separation loss D^2_ij < m', type=float, default=10.0)
-        parser.add_argument('--sep-eps', help='Small epsilon added to pooled covariance for invertibility', type=float, default=1e-6)
+        parser.add_argument('--sep-pooled-eps', help='Small epsilon added to pooled covariance for invertibility', type=float, default=1e-6)
 
         return parser.parse_known_args(args)
 
