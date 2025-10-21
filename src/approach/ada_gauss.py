@@ -71,7 +71,8 @@ class Appr(Inc_Learning_Appr):
                  momentum=0, wd=0, multi_softmax=False, wu_nepochs=0, wu_lr_factor=1, nnet="resnet18", patience=5, fix_bn=False, eval_on_train=False,
                  logger=None, N=10000, alpha=1., lr_backbone=0.01, lr_adapter=0.01, beta=1., distillation="projected", use_224=False, S=64, dump=False, rotation=False, distiller="linear", adapter="linear", criterion="proxy-nca", lamb=10, tau=2, smoothing=0., sval_fraction=0.95,
                  adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes", 
-                 gamma_supcon=1.0, supcon_tau=0.07, samples_per_class=10):
+                 gamma_supcon=1.0, supcon_tau=0.07, samples_per_class=10,
+                 gamma_sep=0.5, sep_margin=10.0, sep_pooled_eps=1e-6):
         super(Appr, self).__init__(model, device, nepochs, lr, lr_min, lr_factor, lr_patience, clipgrad, momentum, wd,
                                    multi_softmax, wu_nepochs, wu_lr_factor, fix_bn, eval_on_train, logger,
                                    exemplars_dataset=None)
@@ -91,6 +92,11 @@ class Appr(Inc_Learning_Appr):
         self.adaptation_strategy = adaptation_strategy
         self.old_model = None
         self.pretrained = pretrained_net
+        # Inter-class separation loss (AdaGauss+)
+        self.gamma_sep = gamma_sep
+        self.sep_margin = sep_margin
+        self.sep_pooled_eps = sep_pooled_eps
+        # Supervised contrastive loss using pseudo-prototypes from memorized Gaussians
         self.gamma_supcon = gamma_supcon
         self.supcon_tau = supcon_tau
         self.samples_per_class = samples_per_class
@@ -171,7 +177,11 @@ class Appr(Inc_Learning_Appr):
         parser.add_argument('--gamma-supcon', help='Weight of supervised contrastive loss (supcon) using pseudo-prototypes', type=float, default=1.0)
         parser.add_argument('--supcon-tau', help='Temperature for supervised contrastive loss', type=float, default=0.07)
         parser.add_argument('--samples-per-class', help='Number of pseudo-prototype samples per class for supcon', type=int, default=10)
-        
+        # Inter-class separation loss (AdaGauss+)
+        parser.add_argument('--gamma-sep', help='Weight of inter-class separation loss (L_sep)', type=float, default=0.5)
+        parser.add_argument('--sep-margin', help='Target margin m for separation loss D^2_ij < m', type=float, default=10.0)
+        parser.add_argument('--sep-eps', help='Small epsilon added to pooled covariance for invertibility', type=float, default=1e-6)
+
         return parser.parse_known_args(args)
 
     def train_loop(self, t, trn_loader, val_loader):
@@ -287,6 +297,13 @@ class Appr(Inc_Learning_Appr):
                 if self.alpha > 0:
                     ac, det = loss_ac(features, self.beta)
                     total_loss += self.alpha * ac
+
+                # Inter-class separation loss (AdaGauss+)
+                if t > 0 and self.gamma_sep > 0.0:
+                    # use pooled covariance computed from stored covs (add eps for invertibility)
+                    sep_val = sep_loss_from_means_covs(self.means, self.covs, margin=self.sep_margin, eps=self.sep_pooled_eps)
+                    # sep_val is computed from means/covs (no grad w.r.t. features) but it is a tensor
+                    total_loss = total_loss + self.gamma_sep * sep_val
 
                 # Supervised contrastive loss using pseudo-prototypes from memorized Gaussians
                 if t > 0 and self.gamma_supcon > 0.0:
@@ -909,3 +926,36 @@ def supcon_loss(features, labels, tau=0.1):
 
     loss_per_sample = - numerator[valid] / (positives_per_sample[valid] + 1e-12)
     return loss_per_sample.mean()
+
+
+def sep_loss_from_means_covs(means, covs, margin=10.0, eps=1e-6):
+    """Inter-class separation loss L_sep computed from class means and covariances.
+    means: (C, D)
+    covs: (C, D, D)
+    Returns scalar (no grad). If C < 2 returns 0.
+    """
+    device = means.device
+    C = means.shape[0]
+    if C < 2:
+        return torch.tensor(0., device=device)
+
+    pooled = covs.mean(dim=0)
+    pooled = pooled + eps * torch.eye(pooled.size(0), device=device)
+
+    # invert pooled covariance
+    pooled_inv = torch.inverse(pooled)
+    A = torch.matmul(means, torch.matmul(pooled_inv, means.T))
+
+    diagA = torch.diag(A).unsqueeze(1)  # (C,1)
+    D2 = diagA + diagA.T - 2.0 * A 
+
+    # consider only i < j pairs
+    i_idx, j_idx = torch.triu_indices(C, C, offset=1)
+    pair_d2 = D2[i_idx, j_idx]
+    
+    # hinge: ReLU(m - D2_ij)
+    hinge = F.relu(margin - pair_d2)
+    if hinge.numel() == 0:
+        return torch.tensor(0., device=device)
+    loss = hinge.mean()
+    return loss
