@@ -71,7 +71,7 @@ class Appr(Inc_Learning_Appr):
                  momentum=0, wd=0, multi_softmax=False, wu_nepochs=0, wu_lr_factor=1, nnet="resnet18", patience=5, fix_bn=False, eval_on_train=False,
                  logger=None, N=10000, alpha=1., lr_backbone=0.01, lr_adapter=0.01, beta=1., distillation="projected", use_224=False, S=64, dump=False, rotation=False, distiller="linear", adapter="linear", criterion="proxy-nca", lamb=10, tau=2, smoothing=0., sval_fraction=0.95,
                  adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes", 
-                 gamma_supcon=1.0, supcon_tau=0.07, samples_per_class=10, gamma_sep=0.0, sep_margin=10.0, sep_pooled_eps=1e-6):
+                 gamma_supcon=1.0, supcon_tau=0.07, samples_per_class=10, gamma_sep=5.0, sep_margin=10.0, sep_pooled_eps=1e-6):
         super(Appr, self).__init__(model, device, nepochs, lr, lr_min, lr_factor, lr_patience, clipgrad, momentum, wd,
                                    multi_softmax, wu_nepochs, wu_lr_factor, fix_bn, eval_on_train, logger,
                                    exemplars_dataset=None)
@@ -181,7 +181,7 @@ class Appr(Inc_Learning_Appr):
         parser.add_argument('--supcon-tau', help='Temperature for supervised contrastive loss', type=float, default=0.07)
         parser.add_argument('--samples-per-class', help='Number of pseudo-prototype samples per class for supcon', type=int, default=10)
         # Inter-class separation loss (AdaGauss+)
-        parser.add_argument('--gamma-sep', help='Weight of inter-class separation loss (L_sep)', type=float, default=0.5)
+        parser.add_argument('--gamma-sep', help='Weight of inter-class separation loss (L_sep)', type=float, default=5.0)
         parser.add_argument('--sep-margin', help='Target margin m for separation loss D^2_ij < m', type=float, default=10.0)
         parser.add_argument('--sep-pooled-eps', help='Small epsilon added to pooled covariance for invertibility', type=float, default=1e-6)
 
@@ -310,6 +310,7 @@ class Appr(Inc_Learning_Appr):
                     # compute separation loss from running stats (this returns tensor with grad=None)
                     sep_val = self.sep_loss_from_running_stats(margin=self.sep_margin, eps=self.sep_pooled_eps)
                     total_loss = total_loss + self.gamma_sep * sep_val
+                    print(f"Sep loss: {sep_val.item():.4f}")
 
                 # Supervised contrastive loss using pseudo-prototypes from memorized Gaussians
                 if t > 0 and self.gamma_supcon > 0.0:
@@ -335,6 +336,7 @@ class Appr(Inc_Learning_Appr):
                         labels_all = torch.cat([abs_targets, pseudo_labels], dim=0)
                         supcon_val = supcon_loss(z_all, labels_all, self.supcon_tau)
                         total_loss = total_loss + self.gamma_supcon * supcon_val
+                        print(f"SupCon loss: {supcon_val.item():.4f}")
                             
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, 1)
