@@ -95,6 +95,10 @@ class Appr(Inc_Learning_Appr):
         self.gamma_sep = gamma_sep
         self.sep_margin = sep_margin
         self.sep_pooled_eps = sep_pooled_eps
+        # running statistics containers for incremental updates (eqs. 5 & 6)
+        self.running_means = {}
+        self.running_covs = {}
+        self.class_counts = {}
         # Supervised contrastive loss using pseudo-prototypes from memorized Gaussians
         self.gamma_supcon = gamma_supcon
         self.supcon_tau = supcon_tau
