@@ -71,8 +71,7 @@ class Appr(Inc_Learning_Appr):
                  momentum=0, wd=0, multi_softmax=False, wu_nepochs=0, wu_lr_factor=1, nnet="resnet18", patience=5, fix_bn=False, eval_on_train=False,
                  logger=None, N=10000, alpha=1., lr_backbone=0.01, lr_adapter=0.01, beta=1., distillation="projected", use_224=False, S=64, dump=False, rotation=False, distiller="linear", adapter="linear", criterion="proxy-nca", lamb=10, tau=2, smoothing=0., sval_fraction=0.95,
                  adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes", 
-                 gamma_supcon=1.0, supcon_tau=0.07, samples_per_class=10,
-                 gamma_sep=0.5, sep_margin=10.0, sep_pooled_eps=1e-6):
+                 gamma_supcon=1.0, supcon_tau=0.07, samples_per_class=10, gamma_sep=0.0, sep_margin=10.0, sep_pooled_eps=1e-6):
         super(Appr, self).__init__(model, device, nepochs, lr, lr_min, lr_factor, lr_patience, clipgrad, momentum, wd,
                                    multi_softmax, wu_nepochs, wu_lr_factor, fix_bn, eval_on_train, logger,
                                    exemplars_dataset=None)
@@ -300,9 +299,12 @@ class Appr(Inc_Learning_Appr):
 
                 # Inter-class separation loss (AdaGauss+)
                 if t > 0 and self.gamma_sep > 0.0:
-                    # use pooled covariance computed from stored covs (add eps for invertibility)
-                    sep_val = sep_loss_from_means_covs(self.means, self.covs, margin=self.sep_margin, eps=self.sep_pooled_eps)
-                    # sep_val is computed from means/covs (no grad w.r.t. features) but it is a tensor
+                    # absolute labels for current mini-batch
+                    abs_targets = targets + self.task_offset[t]
+                    # update running stats per class using this minibatch (eqs. 5 & 6)
+                    self.update_running_stats_for_batch(features.detach(), abs_targets)
+                    # compute separation loss from running stats (this returns tensor with grad=None)
+                    sep_val = self.sep_loss_from_running_stats(margin=self.sep_margin, eps=self.sep_pooled_eps)
                     total_loss = total_loss + self.gamma_sep * sep_val
 
                 # Supervised contrastive loss using pseudo-prototypes from memorized Gaussians
@@ -384,6 +386,70 @@ class Appr(Inc_Learning_Appr):
 
         if self.distillation == "logit":
             self.heads.append(criterion.head)
+
+    def update_running_stats_for_batch(self, features, abs_labels):
+        """Update per-class running means and covariances using equations (5) and (6).
+        features: (B, D) tensor (can be detached)
+        abs_labels: (B,) absolute class ids
+        """
+        device = features.device
+        unique = torch.unique(abs_labels)
+        for c in unique:
+            c_int = int(c.item())
+            mask = (abs_labels == c)
+            x_c = features[mask]
+            n_batch = x_c.size(0)
+            if n_batch == 0:
+                continue
+            x_bar = x_c.mean(dim=0)
+            if n_batch > 1:
+                centered = x_c - x_bar.unsqueeze(0)
+                Sigma_batch = (centered.T @ centered) / (n_batch - 1)
+            else:
+                Sigma_batch = torch.zeros((features.size(1), features.size(1)), device=device)
+
+            if c_int not in self.running_means:
+                self.running_means[c_int] = x_bar.clone()
+                self.running_covs[c_int] = Sigma_batch.clone()
+                self.class_counts[c_int] = n_batch
+            else:
+                n_c = self.class_counts[c_int]
+                mu_old = self.running_means[c_int]
+                # eq (5)
+                self.running_means[c_int] = mu_old + (n_batch / (n_c + n_batch)) * (x_bar - mu_old)
+                # eq (6)
+                if (n_c + n_batch - 2) > 0:
+                    Sigma_old = self.running_covs[c_int]
+                    numerator = (n_c - 1) * Sigma_old + (n_batch - 1) * Sigma_batch
+                    self.running_covs[c_int] = numerator / (n_c + n_batch - 2)
+                # update counts
+                self.class_counts[c_int] = n_c + n_batch
+
+    def sep_loss_from_running_stats(self, margin=10.0, eps=1e-6):
+        """Compute L_sep from the current running_means and running_covs dictionaries.
+        Returns a scalar tensor (with grad_fn if possible).
+        """
+        if len(self.running_means) < 2:
+            # return zero that won't break backward
+            if len(self.running_means) == 1:
+                return next(iter(self.running_means.values())).sum() * 0.0
+            return torch.tensor(0., device=self.device)
+
+        ids = sorted(self.running_means.keys())
+        means = torch.stack([self.running_means[i] for i in ids], dim=0)  # (C, D)
+        covs = torch.stack([self.running_covs[i] for i in ids], dim=0)    # (C, D, D)
+
+        pooled = covs.mean(dim=0) + eps * torch.eye(covs.size(1), device=self.device)
+        pooled_inv = torch.inverse(pooled)
+        A = means @ pooled_inv @ means.T
+        diagA = torch.diag(A).unsqueeze(1)
+        D2 = diagA + diagA.T - 2.0 * A
+        i_idx, j_idx = torch.triu_indices(D2.size(0), D2.size(0), offset=1)
+        pair_d2 = D2[i_idx, j_idx]
+        hinge = F.relu(margin - pair_d2)
+        if hinge.numel() == 0:
+            return means.sum() * 0.0
+        return hinge.mean()
 
     @torch.no_grad()
     def create_distributions(self, t, trn_loader, val_loader, num_classes_in_t):
@@ -926,36 +992,3 @@ def supcon_loss(features, labels, tau=0.1):
 
     loss_per_sample = - numerator[valid] / (positives_per_sample[valid] + 1e-12)
     return loss_per_sample.mean()
-
-
-def sep_loss_from_means_covs(means, covs, margin=10.0, eps=1e-6):
-    """Inter-class separation loss L_sep computed from class means and covariances.
-    means: (C, D)
-    covs: (C, D, D)
-    Returns scalar (no grad). If C < 2 returns 0.
-    """
-    device = means.device
-    C = means.shape[0]
-    if C < 2:
-        return torch.tensor(0., device=device)
-
-    pooled = covs.mean(dim=0)
-    pooled = pooled + eps * torch.eye(pooled.size(0), device=device)
-
-    # invert pooled covariance
-    pooled_inv = torch.inverse(pooled)
-    A = torch.matmul(means, torch.matmul(pooled_inv, means.T))
-
-    diagA = torch.diag(A).unsqueeze(1)  # (C,1)
-    D2 = diagA + diagA.T - 2.0 * A 
-
-    # consider only i < j pairs
-    i_idx, j_idx = torch.triu_indices(C, C, offset=1)
-    pair_d2 = D2[i_idx, j_idx]
-    
-    # hinge: ReLU(m - D2_ij)
-    hinge = F.relu(margin - pair_d2)
-    if hinge.numel() == 0:
-        return torch.tensor(0., device=device)
-    loss = hinge.mean()
-    return loss
