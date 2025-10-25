@@ -95,6 +95,10 @@ class Appr(Inc_Learning_Appr):
         # Inter-Class Separation Regularization parameters
         self.sep_gamma = sep_gamma  # Weight for separation loss (γ_sep)
         self.margin = margin  # Margin m for hinge loss
+        
+        # Separate running statistics for separation loss during training
+        self.new_means = []  # Running means cloned from self.means + new classes
+        self.new_covs = []   # Running covs cloned from self.covs + new classes
         self.class_sample_counts = []  # Track sample counts per class for incremental updates
         
         self.pseudo_head = None
@@ -287,9 +291,30 @@ class Appr(Inc_Learning_Appr):
         print(f'The model has {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,} trainable parameters')
         print(f'The expert has {sum(p.numel() for p in self.model.parameters() if not p.requires_grad):,} shared parameters\n')
         
-        # Initialize sample counts for new classes (for incremental mean/cov updates)
-        for _ in range(num_classes_in_t):
-            self.class_sample_counts.append(0)
+        # Initialize new_means and new_covs for separation loss computation
+        if t == 0:
+            # First task: just initialize for new classes
+            for _ in range(num_classes_in_t):
+                self.new_means.append(torch.zeros(self.S, device=self.device))
+                self.new_covs.append(torch.zeros((self.S, self.S), device=self.device))
+                self.class_sample_counts.append(0)
+        else:
+            # Subsequent tasks: Clone from existing self.means and self.covs, then add new classes
+            self.new_means = []
+            self.new_covs = []
+            self.class_sample_counts = []
+            
+            # Clone old class prototypes from self.means and self.covs
+            for c in range(self.task_offset[t]):
+                self.new_means.append(self.means[c].clone())
+                self.new_covs.append(self.covs[c].clone())
+                self.class_sample_counts.append(0)  # Reset count for incremental updates
+            
+            # Add placeholders for new classes
+            for _ in range(num_classes_in_t):
+                self.new_means.append(torch.zeros(self.S, device=self.device))
+                self.new_covs.append(torch.zeros((self.S, self.S), device=self.device))
+                self.class_sample_counts.append(0)
         
         distiller = nn.Linear(self.S, self.S)
         if self.distiller_type == "mlp":
@@ -908,8 +933,8 @@ class Appr(Inc_Learning_Appr):
 
     def update_means_covs_incremental(self, features, targets, task_id):
         """
-        Update self.means and self.covs incrementally during training using equations (5) and (6).
-        This updates the AdaGauss prototypes directly, not separate running statistics.
+        Update self.new_means and self.new_covs incrementally during training using equations (5) and (6).
+        These are separate from AdaGauss prototypes and used only for separation loss during training.
         
         Args:
             features: Batch of features (batch_size, S)
@@ -938,11 +963,11 @@ class Appr(Inc_Learning_Appr):
                 
                 if n_c == 0:
                     # First update: just use batch mean
-                    self.means[global_class_idx] = x_bar_c
+                    self.new_means[global_class_idx] = x_bar_c
                 else:
                     # Incremental update: μ_c^(t) ← μ_c^(t) + (n_batch / (n_c + n_batch)) * (x̄_c - μ_c^(t))
-                    mu_c_old = self.means[global_class_idx].clone()
-                    self.means[global_class_idx] = mu_c_old + (n_batch / (n_c + n_batch)) * (x_bar_c - mu_c_old)
+                    mu_c_old = self.new_means[global_class_idx].clone()
+                    self.new_means[global_class_idx] = mu_c_old + (n_batch / (n_c + n_batch)) * (x_bar_c - mu_c_old)
                 
                 # Update covariance using equation (6)
                 if n_batch > 1:
@@ -951,11 +976,11 @@ class Appr(Inc_Learning_Appr):
                     
                     if n_c == 0:
                         # First update: just use batch covariance
-                        self.covs[global_class_idx] = Sigma_batch
+                        self.new_covs[global_class_idx] = Sigma_batch
                     else:
                         # Incremental update: Σ_c^(t) ← ((n_c - 1)Σ_c^(t) + (n_batch - 1)Σ_batch) / (n_c + n_batch - 2)
-                        self.covs[global_class_idx] = (
-                            (n_c - 1) * self.covs[global_class_idx] + 
+                        self.new_covs[global_class_idx] = (
+                            (n_c - 1) * self.new_covs[global_class_idx] + 
                             (n_batch - 1) * Sigma_batch
                         ) / (n_c + n_batch - 2)
                 
@@ -966,7 +991,7 @@ class Appr(Inc_Learning_Appr):
     def compute_separation_loss(self, t):
         """
         Compute Inter-Class Separation Regularization loss using equations (7), (8), and (9).
-        Uses self.means and self.covs directly (AdaGauss prototypes).
+        Uses self.new_means and self.new_covs (running statistics during training).
         
         Args:
             t: Current task id
@@ -977,10 +1002,10 @@ class Appr(Inc_Learning_Appr):
         if t == 0:
             return torch.tensor(0.0, device=self.device)
         
-        # Gather all means M and covariances Σ from AdaGauss prototypes
+        # Gather all means M and covariances Σ from running statistics
         total_classes = self.task_offset[t + 1]
-        M = self.means[:total_classes]  # Shape: (|C|, S)
-        Sigma = self.covs[:total_classes]  # Shape: (|C|, S, S)
+        M = torch.stack(self.new_means[:total_classes], dim=0)  # Shape: (|C|, S)
+        Sigma = torch.stack(self.new_covs[:total_classes], dim=0)  # Shape: (|C|, S, S)
         
         # Compute pooled covariance matrix using equation (7)
         # Σ_pooled = (1/|C|) * Σ_{c=1}^{|C|} Σ_c^(t) + εI
