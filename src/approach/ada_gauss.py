@@ -44,7 +44,7 @@ class Appr(Inc_Learning_Appr):
     def __init__(self, model, device, nepochs=200, lr=0.05, lr_min=1e-4, lr_factor=3, lr_patience=5, clipgrad=1,
                  momentum=0, wd=0, multi_softmax=False, wu_nepochs=0, wu_lr_factor=1, nnet="resnet18", patience=5, fix_bn=False, eval_on_train=False,
                  logger=None, N=10000, alpha=1., lr_backbone=0.01, lr_adapter=0.01, beta=1., distillation="projected", use_224=False, S=64, dump=False, rotation=False, distiller="linear", adapter="linear", criterion="proxy-nca", lamb=10, tau=2, smoothing=0., sval_fraction=0.95,
-                 adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes"):
+                 adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes", sep_gamma=0.5, margin=10.0):
         super(Appr, self).__init__(model, device, nepochs, lr, lr_min, lr_factor, lr_patience, clipgrad, momentum, wd,
                                    multi_softmax, wu_nepochs, wu_lr_factor, fix_bn, eval_on_train, logger,
                                    exemplars_dataset=None)
@@ -91,6 +91,12 @@ class Appr(Inc_Learning_Appr):
         self.covs_raw = torch.empty((0, self.S, self.S), device=self.device)  # not shrinked, not adapted
         self.covs_inverted = None
         self.classifier = classifier
+        
+        # Inter-Class Separation Regularization parameters
+        self.sep_gamma = sep_gamma  # Weight for separation loss (γ_sep)
+        self.margin = margin  # Margin m for hinge loss
+        self.class_sample_counts = []  # Track sample counts per class for incremental updates
+        
         self.pseudo_head = None
         self.is_normalization = normalize
         self.is_rotation = rotation
@@ -147,6 +153,14 @@ class Appr(Inc_Learning_Appr):
                             help='temperature for logit distill',
                             type=float,
                             default=2)
+        parser.add_argument('--sep-gamma',
+                            help='Weight for separation loss (γ_sep)',
+                            type=float,
+                            default=0.5)
+        parser.add_argument('--margin',
+                            help='Margin m for hinge loss in separation regularization',
+                            type=float,
+                            default=10.0)
         parser.add_argument('--shrink',
                             help='shrink during training',
                             type=float,
@@ -272,6 +286,11 @@ class Appr(Inc_Learning_Appr):
         val_loader = torch.utils.data.DataLoader(val_loader.dataset, batch_size=val_loader.batch_size, num_workers=val_loader.num_workers, shuffle=False, drop_last=True)
         print(f'The model has {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,} trainable parameters')
         print(f'The expert has {sum(p.numel() for p in self.model.parameters() if not p.requires_grad):,} shared parameters\n')
+        
+        # Initialize sample counts for new classes (for incremental mean/cov updates)
+        for _ in range(num_classes_in_t):
+            self.class_sample_counts.append(0)
+        
         distiller = nn.Linear(self.S, self.S)
         if self.distiller_type == "mlp":
             distiller = nn.Sequential(nn.Linear(self.S, self.multiplier * self.S),
@@ -299,6 +318,7 @@ class Appr(Inc_Learning_Appr):
         for epoch in range(self.nepochs):
             train_loss, train_kd_loss, valid_loss, valid_kd_loss = [], [], [], []
             train_ac, train_determinant = [], []
+            train_sep_loss = []  # Track separation loss
             train_hits, val_hits, train_total, val_total = 0, 0, 0, 0
             self.model.train()
             criterion.train()
@@ -312,6 +332,11 @@ class Appr(Inc_Learning_Appr):
                 images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True)
                 optimizer.zero_grad()
                 features = self.model(images)
+                
+                # Update running statistics for separation loss (only for t > 0)
+                if t > 0:
+                    self.update_means_covs_incremental(features, targets, t)
+                
                 if epoch < int(self.nepochs * 0.01):
                     features = features.detach()
                 loss, logits = criterion(features, targets)
@@ -329,6 +354,13 @@ class Appr(Inc_Learning_Appr):
                 if self.alpha > 0:
                     ac, det = loss_ac(features, self.beta)
                     total_loss += self.alpha * ac
+                
+                # Add separation loss (only for t > 0)
+                sep_loss = torch.tensor(0.0, device=self.device)
+                if t > 0:
+                    sep_loss = self.compute_separation_loss(t)
+                    total_loss += self.sep_gamma * sep_loss
+                
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, 1)
                 optimizer.step()
@@ -338,6 +370,7 @@ class Appr(Inc_Learning_Appr):
                 train_ac.append(float(ac))
                 train_determinant.append(float(torch.clamp(torch.abs(det), max=1e8)))
                 train_kd_loss.append(float(bsz * kd_loss))
+                train_sep_loss.append(float(bsz * sep_loss))
             lr_scheduler.step()
 
             val_total = 1e-8
@@ -371,6 +404,7 @@ class Appr(Inc_Learning_Appr):
 
             train_loss = sum(train_loss) / train_total
             train_kd_loss = sum(train_kd_loss) / train_total
+            train_sep_loss_avg = sum(train_sep_loss) / train_total if train_sep_loss else 0.0
             train_determinant = sum(train_determinant) / len(train_determinant)
             valid_loss = sum(valid_loss) / val_total
             valid_kd_loss = sum(valid_kd_loss) / val_total
@@ -378,8 +412,12 @@ class Appr(Inc_Learning_Appr):
             train_acc = train_hits / train_total
             val_acc = val_hits / val_total
 
-            print(f"Epoch: {epoch} Train: {train_loss:.2f} KD: {train_kd_loss:.3f} Acc: {100 * train_acc:.2f} Singularity: {train_ac:.3f} Det: {train_determinant:.5f} "
-                  f"Val: {valid_loss:.2f} KD: {valid_kd_loss:.3f} Acc: {100 * val_acc:.2f}")
+            if t > 0:
+                print(f"Epoch: {epoch} Train: {train_loss:.2f} KD: {train_kd_loss:.3f} Sep: {train_sep_loss_avg:.5f} Acc: {100 * train_acc:.2f} Singularity: {train_ac:.3f} Det: {train_determinant:.5f} "
+                      f"Val: {valid_loss:.2f} KD: {valid_kd_loss:.3f} Acc: {100 * val_acc:.2f}")
+            else:
+                print(f"Epoch: {epoch} Train: {train_loss:.2f} KD: {train_kd_loss:.3f} Acc: {100 * train_acc:.2f} Singularity: {train_ac:.3f} Det: {train_determinant:.5f} "
+                      f"Val: {valid_loss:.2f} KD: {valid_kd_loss:.3f} Acc: {100 * val_acc:.2f}")
 
         if self.distillation == "logit":
             self.heads.append(criterion.head)
@@ -868,6 +906,109 @@ class Appr(Inc_Learning_Appr):
 
         print(f"Mahalanobis per task: {list(mahalanobis_per_task)}")
 
+    def update_means_covs_incremental(self, features, targets, task_id):
+        """
+        Update self.means and self.covs incrementally during training using equations (5) and (6).
+        This updates the AdaGauss prototypes directly, not separate running statistics.
+        
+        Args:
+            features: Batch of features (batch_size, S)
+            targets: Batch of class labels (relative to current task)
+            task_id: Current task id
+        """
+        with torch.no_grad():
+            unique_classes = torch.unique(targets)
+            for c in unique_classes:
+                c_int = int(c)
+                global_class_idx = self.task_offset[task_id] + c_int
+                
+                # Get features for this class in the batch
+                class_mask = (targets == c)
+                class_features = features[class_mask]
+                n_batch = class_features.shape[0]
+                
+                if n_batch == 0:
+                    continue
+                
+                # Compute batch statistics
+                x_bar_c = class_features.mean(dim=0)  # Batch mean
+                
+                # Update mean using equation (5)
+                n_c = self.class_sample_counts[global_class_idx]
+                
+                if n_c == 0:
+                    # First update: just use batch mean
+                    self.means[global_class_idx] = x_bar_c
+                else:
+                    # Incremental update: μ_c^(t) ← μ_c^(t) + (n_batch / (n_c + n_batch)) * (x̄_c - μ_c^(t))
+                    mu_c_old = self.means[global_class_idx].clone()
+                    self.means[global_class_idx] = mu_c_old + (n_batch / (n_c + n_batch)) * (x_bar_c - mu_c_old)
+                
+                # Update covariance using equation (6)
+                if n_batch > 1:
+                    centered_features = class_features - x_bar_c.unsqueeze(0)
+                    Sigma_batch = (centered_features.T @ centered_features) / (n_batch - 1)
+                    
+                    if n_c == 0:
+                        # First update: just use batch covariance
+                        self.covs[global_class_idx] = Sigma_batch
+                    else:
+                        # Incremental update: Σ_c^(t) ← ((n_c - 1)Σ_c^(t) + (n_batch - 1)Σ_batch) / (n_c + n_batch - 2)
+                        self.covs[global_class_idx] = (
+                            (n_c - 1) * self.covs[global_class_idx] + 
+                            (n_batch - 1) * Sigma_batch
+                        ) / (n_c + n_batch - 2)
+                
+                # Update count
+                self.class_sample_counts[global_class_idx] = n_c + n_batch
+
+
+    def compute_separation_loss(self, t):
+        """
+        Compute Inter-Class Separation Regularization loss using equations (7), (8), and (9).
+        Uses self.means and self.covs directly (AdaGauss prototypes).
+        
+        Args:
+            t: Current task id
+            
+        Returns:
+            Separation loss value
+        """
+        if t == 0:
+            return torch.tensor(0.0, device=self.device)
+        
+        # Gather all means M and covariances Σ from AdaGauss prototypes
+        total_classes = self.task_offset[t + 1]
+        M = self.means[:total_classes]  # Shape: (|C|, S)
+        Sigma = self.covs[:total_classes]  # Shape: (|C|, S, S)
+        
+        # Compute pooled covariance matrix using equation (7)
+        # Σ_pooled = (1/|C|) * Σ_{c=1}^{|C|} Σ_c^(t) + εI
+        epsilon = 1e-6
+        Sigma_pooled = Sigma.mean(dim=0) + epsilon * torch.eye(self.S, device=self.device)
+        
+        # Compute A = M * Σ_pooled^{-1} * M^T
+        Sigma_pooled_inv = torch.inverse(Sigma_pooled)
+        A = M @ Sigma_pooled_inv @ M.T  # Shape: (|C|, |C|)
+        
+        # Compute D^2 using equation (8)
+        # D^2 = diag(A) + diag(A)^T - 2A
+        diag_A = torch.diag(A)  # Shape: (|C|,)
+        D_squared = diag_A.unsqueeze(1) + diag_A.unsqueeze(0) - 2 * A  # Shape: (|C|, |C|)
+        
+        # Compute separation loss using equation (9)
+        # L_sep = (1/N_pairs) * Σ_{i<j} ReLU(m - D_{ij}^2)
+        N_pairs = total_classes * (total_classes - 1) / 2
+        
+        # Sum over upper triangle (i < j)
+        loss_sum = 0.0
+        for i in range(total_classes):
+            for j in range(i + 1, total_classes):
+                loss_sum += torch.relu(self.margin - D_squared[i, j])
+        
+        L_sep = loss_sum / N_pairs if N_pairs > 0 else torch.tensor(0.0, device=self.device)
+        
+        return L_sep
 
 def compute_rotations(images, targets, total_classes):
     # compute self-rotation for the first task following PASS https://github.com/Impression2805/CVPR21_PASS
@@ -886,3 +1027,5 @@ def loss_ac(features, beta):
     # if bool(torch.isinf(loss)) or bool(torch.isnan(loss)):
     #     return torch.tensor(7777.), torch.tensor(0.)
     return loss, torch.det(cov)
+
+    
