@@ -96,11 +96,6 @@ class Appr(Inc_Learning_Appr):
         self.sep_gamma = sep_gamma  # Weight for separation loss (γ_sep)
         self.margin = margin  # Margin m for hinge loss
         
-        # Separate running statistics for separation loss during training
-        self.new_means = []  # Running means cloned from self.means + new classes
-        self.new_covs = []   # Running covs cloned from self.covs + new classes
-        self.class_sample_counts = []  # Track sample counts per class for incremental updates
-        
         self.pseudo_head = None
         self.is_normalization = normalize
         self.is_rotation = rotation
@@ -291,30 +286,11 @@ class Appr(Inc_Learning_Appr):
         print(f'The model has {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,} trainable parameters')
         print(f'The expert has {sum(p.numel() for p in self.model.parameters() if not p.requires_grad):,} shared parameters\n')
         
-        # Initialize new_means and new_covs for separation loss computation
-        if t == 0:
-            # First task: just initialize for new classes
-            for _ in range(num_classes_in_t):
-                self.new_means.append(torch.zeros(self.S, device=self.device))
-                self.new_covs.append(torch.zeros((self.S, self.S), device=self.device))
-                self.class_sample_counts.append(0)
-        else:
-            # Subsequent tasks: Clone from existing self.means and self.covs, then add new classes
-            self.new_means = []
-            self.new_covs = []
-            self.class_sample_counts = []
-            
-            # Clone old class prototypes from self.means and self.covs
-            for c in range(self.task_offset[t]):
-                self.new_means.append(self.means[c].clone())
-                self.new_covs.append(self.covs[c].clone())
-                self.class_sample_counts.append(0)  # Reset count for incremental updates
-            
-            # Add placeholders for new classes
-            for _ in range(num_classes_in_t):
-                self.new_means.append(torch.zeros(self.S, device=self.device))
-                self.new_covs.append(torch.zeros((self.S, self.S), device=self.device))
-                self.class_sample_counts.append(0)
+        # Initialize running means and covariances for new classes (only for t > 0)
+        if t > 0:
+            new_class_means = torch.zeros((num_classes_in_t, self.S), device=self.device, requires_grad=False)
+            new_class_covs = torch.zeros((num_classes_in_t, self.S, self.S), device=self.device, requires_grad=False)
+            new_class_counts = torch.zeros(num_classes_in_t, device=self.device)
         
         distiller = nn.Linear(self.S, self.S)
         if self.distiller_type == "mlp":
@@ -358,10 +334,6 @@ class Appr(Inc_Learning_Appr):
                 optimizer.zero_grad()
                 features = self.model(images)
                 
-                # Update running statistics for separation loss (only for t > 0)
-                if t > 0:
-                    self.update_means_covs_incremental(features, targets, t)
-                
                 if epoch < int(self.nepochs * 0.01):
                     features = features.detach()
                 loss, logits = criterion(features, targets)
@@ -380,10 +352,26 @@ class Appr(Inc_Learning_Appr):
                     ac, det = loss_ac(features, self.beta)
                     total_loss += self.alpha * ac
                 
-                # Add separation loss (only for t > 0)
+                # Update running statistics and compute separation loss (only for t > 0)
                 sep_loss = torch.tensor(0.0, device=self.device)
                 if t > 0:
-                    sep_loss = self.compute_separation_loss(t)
+                    # Update running means and covariances for new classes
+                    with torch.no_grad():
+                        for c in range(num_classes_in_t):
+                            class_mask = (targets == c)
+                            if class_mask.any():
+                                class_features = features[class_mask].detach()
+                                batch_mean = class_features.mean(dim=0)
+                                batch_cov = torch.cov(class_features.T) if class_features.shape[0] > 1 else torch.zeros((self.S, self.S), device=self.device)
+                                count = class_features.shape[0]
+                                new_class_counts[c] += count
+                                delta = batch_mean - new_class_means[c]
+                                new_class_means[c] += delta * (count / new_class_counts[c])
+                                if class_features.shape[0] > 1:
+                                    new_class_covs[c] = ((new_class_counts[c] - count) * new_class_covs[c] + (count - 1) * batch_cov) / (new_class_counts[c] - 1)
+                    
+                    # Compute separation loss
+                    sep_loss = self.compute_separation_loss(t, num_classes_in_t, new_class_means, new_class_covs)
                     total_loss += self.sep_gamma * sep_loss
                 
                 total_loss.backward()
@@ -931,70 +919,16 @@ class Appr(Inc_Learning_Appr):
 
         print(f"Mahalanobis per task: {list(mahalanobis_per_task)}")
 
-    def update_means_covs_incremental(self, features, targets, task_id):
+    def compute_separation_loss(self, t, num_classes_in_t, new_class_means, new_class_covs):
         """
-        Update self.new_means and self.new_covs incrementally during training using equations (5) and (6).
-        These are separate from AdaGauss prototypes and used only for separation loss during training.
-        
-        Args:
-            features: Batch of features (batch_size, S)
-            targets: Batch of class labels (relative to current task)
-            task_id: Current task id
-        """
-        with torch.no_grad():
-            unique_classes = torch.unique(targets)
-            for c in unique_classes:
-                c_int = int(c)
-                global_class_idx = self.task_offset[task_id] + c_int
-                
-                # Get features for this class in the batch
-                class_mask = (targets == c)
-                class_features = features[class_mask]
-                n_batch = class_features.shape[0]
-                
-                if n_batch == 0:
-                    continue
-                
-                # Compute batch statistics
-                x_bar_c = class_features.mean(dim=0)  # Batch mean
-                
-                # Update mean using equation (5)
-                n_c = self.class_sample_counts[global_class_idx]
-                
-                if n_c == 0:
-                    # First update: just use batch mean
-                    self.new_means[global_class_idx] = x_bar_c
-                else:
-                    # Incremental update: μ_c^(t) ← μ_c^(t) + (n_batch / (n_c + n_batch)) * (x̄_c - μ_c^(t))
-                    mu_c_old = self.new_means[global_class_idx].clone()
-                    self.new_means[global_class_idx] = mu_c_old + (n_batch / (n_c + n_batch)) * (x_bar_c - mu_c_old)
-                
-                # Update covariance using equation (6)
-                if n_batch > 1:
-                    centered_features = class_features - x_bar_c.unsqueeze(0)
-                    Sigma_batch = (centered_features.T @ centered_features) / (n_batch - 1)
-                    
-                    if n_c == 0:
-                        # First update: just use batch covariance
-                        self.new_covs[global_class_idx] = Sigma_batch
-                    else:
-                        # Incremental update: Σ_c^(t) ← ((n_c - 1)Σ_c^(t) + (n_batch - 1)Σ_batch) / (n_c + n_batch - 2)
-                        self.new_covs[global_class_idx] = (
-                            (n_c - 1) * self.new_covs[global_class_idx] + 
-                            (n_batch - 1) * Sigma_batch
-                        ) / (n_c + n_batch - 2)
-                
-                # Update count
-                self.class_sample_counts[global_class_idx] = n_c + n_batch
-
-
-    def compute_separation_loss(self, t):
-        """
-        Compute Inter-Class Separation Regularization loss using equations (7), (8), and (9).
-        Uses self.new_means and self.new_covs (running statistics during training).
+        Compute Inter-Class Separation Regularization loss using pooled covariance and vectorized operations.
+        This is the optimized version from the reference code.
         
         Args:
             t: Current task id
+            num_classes_in_t: Number of classes in current task
+            new_class_means: Running means for new classes (num_classes_in_t, S)
+            new_class_covs: Running covariances for new classes (num_classes_in_t, S, S)
             
         Returns:
             Separation loss value
@@ -1002,38 +936,43 @@ class Appr(Inc_Learning_Appr):
         if t == 0:
             return torch.tensor(0.0, device=self.device)
         
-        # Gather all means M and covariances Σ from running statistics
-        total_classes = self.task_offset[t + 1]
-        M = torch.stack(self.new_means[:total_classes], dim=0)  # Shape: (|C|, S)
-        Sigma = torch.stack(self.new_covs[:total_classes], dim=0)  # Shape: (|C|, S, S)
-        
-        # Compute pooled covariance matrix using equation (7)
-        # Σ_pooled = (1/|C|) * Σ_{c=1}^{|C|} Σ_c^(t) + εI
+        # All classes: old + new
+        all_means = torch.cat((self.means, new_class_means), dim=0)
+        all_covs = torch.cat((self.covs, new_class_covs), dim=0)
+        num_classes = all_means.shape[0]
+
+        # Compute pooled covariance
+        pooled_cov = torch.mean(all_covs, dim=0)
+
+        # Add small epsilon to diagonal for numerical stability
         epsilon = 1e-6
-        Sigma_pooled = Sigma.mean(dim=0) + epsilon * torch.eye(self.S, device=self.device)
+        pooled_cov += epsilon * torch.eye(self.S, device=self.device)
+
+        # Compute inverse of pooled covariance
+        M = torch.inverse(pooled_cov)
+
+        # Compute A = all_means @ M @ all_means.T
+        A = all_means @ M @ all_means.T
+
+        # Compute diagonal of A
+        diag_A = torch.diag(A)
+
+        # Compute pairwise squared distances (vectorized)
+        distances = diag_A.unsqueeze(0) + diag_A.unsqueeze(1) - 2 * A
+
+        # Get upper triangle (i < j)
+        upper_tri = torch.triu(distances, diagonal=1)
+
+        # Compute separation loss with hinge
+        sep_loss = torch.sum(torch.relu(self.margin - upper_tri))
+
+        # Number of pairs
+        total_pairs = num_classes * (num_classes - 1) / 2
+
+        if total_pairs > 0:
+            sep_loss /= total_pairs
         
-        # Compute A = M * Σ_pooled^{-1} * M^T
-        Sigma_pooled_inv = torch.inverse(Sigma_pooled)
-        A = M @ Sigma_pooled_inv @ M.T  # Shape: (|C|, |C|)
-        
-        # Compute D^2 using equation (8)
-        # D^2 = diag(A) + diag(A)^T - 2A
-        diag_A = torch.diag(A)  # Shape: (|C|,)
-        D_squared = diag_A.unsqueeze(1) + diag_A.unsqueeze(0) - 2 * A  # Shape: (|C|, |C|)
-        
-        # Compute separation loss using equation (9)
-        # L_sep = (1/N_pairs) * Σ_{i<j} ReLU(m - D_{ij}^2)
-        N_pairs = total_classes * (total_classes - 1) / 2
-        
-        # Sum over upper triangle (i < j)
-        loss_sum = 0.0
-        for i in range(total_classes):
-            for j in range(i + 1, total_classes):
-                loss_sum += torch.relu(self.margin - D_squared[i, j])
-        
-        L_sep = loss_sum / N_pairs if N_pairs > 0 else torch.tensor(0.0, device=self.device)
-        
-        return L_sep
+        return sep_loss
 
 def compute_rotations(images, targets, total_classes):
     # compute self-rotation for the first task following PASS https://github.com/Impression2805/CVPR21_PASS
